@@ -35,15 +35,26 @@ from src.model import DSSFN
 import src.engine as engine
 
 # --- Setup Logging ---
+# Ensure output directory exists
+os.makedirs(base_cfg.OUTPUT_DIR, exist_ok=True)
+
 log_filename = f"optimization_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+log_filepath = os.path.join(base_cfg.OUTPUT_DIR, log_filename)
+
+# Remove any existing handlers and configure fresh (force=True for Python 3.8+)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(base_cfg.OUTPUT_DIR, log_filename)),
+        logging.FileHandler(log_filepath),
         logging.StreamHandler(sys.stdout)
     ]
 )
+
+logging.info(f"Logging to file: {log_filepath}")
 
 def get_dataset_config(dataset_name):
     """Returns the configuration dictionary for a specific dataset."""
