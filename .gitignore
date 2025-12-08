@@ -34,3 +34,9 @@ notebooks/
 
 # Ignore :Zone.Identifier files
 *:Zone.Identifier
+
+# Internal notes & documentation
+docs/
+
+# Results
+results/
