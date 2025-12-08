@@ -9,8 +9,8 @@ from sklearn.metrics import accuracy_score, cohen_kappa_score, classification_re
 import logging
 import copy # For deepcopying model state
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Get logger for this module (configuration done by calling script)
+logger = logging.getLogger(__name__)
 
 def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader,
                 device, epochs, loss_epsilon=1e-7, use_scheduler=True,
@@ -60,7 +60,7 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
     early_stopping_triggered = False
 
     if early_stopping_enabled and val_loader is None:
-        logging.warning("Early stopping is enabled, but no validation loader is provided. Early stopping will be disabled.")
+        logger.warning("Early stopping is enabled, but no validation loader is provided. Early stopping will be disabled.")
         early_stopping_enabled = False # Disable if no val_loader
 
     for epoch in range(epochs):
@@ -206,24 +206,24 @@ def train_model(model, criterion, optimizer, scheduler, train_loader, val_loader
                     log_message += f" (ES patience for '{early_stopping_metric}': {epochs_no_improve}/{early_stopping_patience})"
 
                 if epochs_no_improve >= early_stopping_patience:
-                    logging.info(f"Early stopping triggered at epoch {epoch + 1} due to no improvement in {early_stopping_metric} for {early_stopping_patience} epochs.")
+                    logger.info(f"Early stopping triggered at epoch {epoch + 1} due to no improvement in {early_stopping_metric} for {early_stopping_patience} epochs.")
                     early_stopping_triggered = True
         
-        logging.info(log_message)
+        logger.info(log_message)
 
         if use_scheduler and scheduler:
             scheduler.step()
             if scheduler.get_last_lr(): 
-                logging.info(f"LR Scheduler stepped. New LR: {scheduler.get_last_lr()[0]:.2e}")
+                logger.info(f"LR Scheduler stepped. New LR: {scheduler.get_last_lr()[0]:.2e}")
 
         if early_stopping_triggered:
             break # Exit epoch loop
 
     if save_best_model and best_model_state_dict:
-        logging.info(f"Loading best model state dict (based on '{early_stopping_metric if val_loader else 'last epoch'}') with value: {best_metric_val_for_saving_model:.4f}")
+        logger.info(f"Loading best model state dict (based on '{early_stopping_metric if val_loader else 'last epoch'}') with value: {best_metric_val_for_saving_model:.4f}")
         model.load_state_dict(best_model_state_dict)
     elif not best_model_state_dict and save_best_model and val_loader:
-        logging.warning("save_best_model was True, but no best_model_state_dict was saved (possibly no improvement or val_loader issue). Final model is from last epoch.")
+        logger.warning("save_best_model was True, but no best_model_state_dict was saved (possibly no improvement or val_loader issue). Final model is from last epoch.")
     
     return model, history
 
@@ -289,14 +289,14 @@ def evaluate_model(model, test_loader, device, criterion, loss_epsilon=1e-7):
     all_labels = np.array(all_labels)
 
     if len(all_labels) == 0 or len(all_preds) == 0:
-        logging.warning("Evaluation dataset was empty or no predictions were made.")
+        logger.warning("Evaluation dataset was empty or no predictions were made.")
         return 0.0, 0.0, 0.0, "No data to evaluate.", np.array([]), np.array([])
 
     if has_criterion and len(test_loader.dataset) > 0 :
         test_loss = running_test_loss / len(test_loader.dataset)
-        logging.info(f"Test Loss: {test_loss:.4f}")
+        logger.info(f"Test Loss: {test_loss:.4f}")
     elif has_criterion: # but dataset is empty
-        logging.warning("Cannot compute test_loss, test_loader.dataset is empty.")
+        logger.warning("Cannot compute test_loss, test_loader.dataset is empty.")
 
 
     overall_accuracy = accuracy_score(all_labels, all_preds)
@@ -323,12 +323,302 @@ def evaluate_model(model, test_loader, device, criterion, loss_epsilon=1e-7):
     else: # Should not happen if there are labels and predictions
         average_accuracy = 0.0
         if len(unique_test_labels) > 0 : # If there were labels but no recalls found
-             logging.warning("Could not calculate AA: class_accuracies list is empty despite having unique labels.")
+             logger.warning("Could not calculate AA: class_accuracies list is empty despite having unique labels.")
 
 
-    logging.info(f"Overall Accuracy (OA): {overall_accuracy:.4f}")
-    logging.info(f"Average Accuracy (AA): {average_accuracy:.4f}")
-    logging.info(f"Kappa Score: {kappa:.4f}")
-    # logging.info(f"Classification Report:\n{report_str}") # Usually too verbose for main log
+    logger.info(f"Overall Accuracy (OA): {overall_accuracy:.4f}")
+    logger.info(f"Average Accuracy (AA): {average_accuracy:.4f}")
+    logger.info(f"Kappa Score: {kappa:.4f}")
+    # logger.info(f"Classification Report:\n{report_str}") # Usually too verbose for main log
 
     return overall_accuracy, average_accuracy, kappa, report_str, all_preds, all_labels
+
+
+# ============================================================================
+# Adaptive Depth Training and Evaluation Functions
+# ============================================================================
+
+def train_adaptive_model(
+    model,
+    criterion,
+    optimizer,
+    scheduler,
+    train_loader,
+    val_loader,
+    device,
+    epochs,
+    ponder_cost_weight=0.01,
+    use_scheduler=True,
+    save_best_model=True,
+    early_stopping_enabled=False,
+    early_stopping_patience=10,
+    early_stopping_metric='val_loss',
+    early_stopping_min_delta=0.0001
+):
+    """
+    Train an AdaptiveDSSFN model with ponder cost regularization.
+    
+    This function extends the standard training loop to handle:
+    - Ponder cost in the loss function
+    - Tracking average computation depth
+    - Stage-wise halting statistics
+    
+    Args:
+        model: AdaptiveDSSFN model instance.
+        criterion: Classification loss function (e.g., CrossEntropyLoss).
+        optimizer: PyTorch optimizer.
+        scheduler: Learning rate scheduler (optional).
+        train_loader: DataLoader for training data.
+        val_loader: DataLoader for validation data (optional).
+        device: Device to train on.
+        epochs: Number of epochs.
+        ponder_cost_weight: Lambda for ponder cost regularization (L_total = L_CE + lambda * L_ponder).
+        use_scheduler: Whether to step the scheduler.
+        save_best_model: Save model state with best validation metric.
+        early_stopping_enabled: Enable early stopping.
+        early_stopping_patience: Patience for early stopping.
+        early_stopping_metric: Metric to monitor ('val_loss' or 'val_accuracy').
+        early_stopping_min_delta: Minimum improvement threshold.
+        
+    Returns:
+        Tuple of (trained_model, history_dict).
+    """
+    history = {
+        'train_loss': [], 'train_accuracy': [], 'train_ponder_cost': [], 'train_avg_depth': [],
+        'val_loss': [], 'val_accuracy': [], 'val_avg_depth': []
+    }
+    
+    best_metric_val = float('inf') if early_stopping_metric == 'val_loss' else float('-inf')
+    best_model_state_dict = None
+    epochs_no_improve = 0
+    early_stopping_triggered = False
+    
+    if early_stopping_enabled and val_loader is None:
+        logger.warning("Early stopping enabled but no val_loader provided. Disabling.")
+        early_stopping_enabled = False
+    
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        running_ce_loss = 0.0
+        running_ponder_loss = 0.0
+        correct_train = 0
+        total_train = 0
+        total_ponder_cost = 0.0
+        total_depth = 0.0
+        
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]", leave=False)
+        for inputs, labels in train_pbar:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Forward pass with ponder cost
+            logits, ponder_cost, halting_step = model(inputs, return_ponder_cost=True)
+            
+            # Classification loss
+            ce_loss = criterion(logits, labels)
+            
+            # Ponder cost loss (mean stages used)
+            ponder_loss = ponder_cost.mean()
+            
+            # Total loss
+            loss = ce_loss + ponder_cost_weight * ponder_loss
+            
+            loss.backward()
+            optimizer.step()
+            
+            # Track metrics
+            running_loss += loss.item() * inputs.size(0)
+            running_ce_loss += ce_loss.item() * inputs.size(0)
+            running_ponder_loss += ponder_loss.item() * inputs.size(0)
+            
+            _, predicted = torch.max(logits.data, 1)
+            total_train += labels.size(0)
+            correct_train += (predicted == labels).sum().item()
+            
+            total_ponder_cost += ponder_cost.sum().item()
+            total_depth += halting_step.float().sum().item()
+            
+            train_pbar.set_postfix({
+                'loss': loss.item(),
+                'ce': ce_loss.item(),
+                'ponder': ponder_loss.item()
+            })
+        
+        # Epoch statistics
+        epoch_train_loss = running_loss / len(train_loader.dataset)
+        epoch_train_accuracy = correct_train / total_train
+        epoch_avg_ponder = total_ponder_cost / total_train
+        epoch_avg_depth = total_depth / total_train
+        
+        history['train_loss'].append(epoch_train_loss)
+        history['train_accuracy'].append(epoch_train_accuracy)
+        history['train_ponder_cost'].append(epoch_avg_ponder)
+        history['train_avg_depth'].append(epoch_avg_depth)
+        
+        log_msg = (f"Epoch {epoch+1}/{epochs} - "
+                   f"Train Loss: {epoch_train_loss:.4f}, "
+                   f"Train Acc: {epoch_train_accuracy:.4f}, "
+                   f"Avg Depth: {epoch_avg_depth:.2f}/3")
+        
+        # Validation
+        if val_loader:
+            model.eval()
+            running_val_loss = 0.0
+            correct_val = 0
+            total_val = 0
+            val_total_depth = 0.0
+            
+            with torch.no_grad():
+                val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", leave=False)
+                for inputs_val, labels_val in val_pbar:
+                    inputs_val, labels_val = inputs_val.to(device), labels_val.to(device)
+                    
+                    logits_val, ponder_cost_val, halting_step_val = model(inputs_val, return_ponder_cost=True)
+                    
+                    ce_loss_val = criterion(logits_val, labels_val)
+                    ponder_loss_val = ponder_cost_val.mean()
+                    loss_val = ce_loss_val + ponder_cost_weight * ponder_loss_val
+                    
+                    running_val_loss += loss_val.item() * inputs_val.size(0)
+                    
+                    _, predicted_val = torch.max(logits_val.data, 1)
+                    total_val += labels_val.size(0)
+                    correct_val += (predicted_val == labels_val).sum().item()
+                    val_total_depth += halting_step_val.float().sum().item()
+            
+            epoch_val_loss = running_val_loss / len(val_loader.dataset)
+            epoch_val_accuracy = correct_val / total_val
+            epoch_val_avg_depth = val_total_depth / total_val
+            
+            history['val_loss'].append(epoch_val_loss)
+            history['val_accuracy'].append(epoch_val_accuracy)
+            history['val_avg_depth'].append(epoch_val_avg_depth)
+            
+            log_msg += f", Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_accuracy:.4f}, Val Depth: {epoch_val_avg_depth:.2f}/3"
+            
+            # Save best model
+            current_metric = epoch_val_loss if early_stopping_metric == 'val_loss' else epoch_val_accuracy
+            is_best = (current_metric < best_metric_val) if early_stopping_metric == 'val_loss' else (current_metric > best_metric_val)
+            
+            if save_best_model and is_best:
+                best_metric_val = current_metric
+                best_model_state_dict = copy.deepcopy(model.state_dict())
+                log_msg += " (New Best!)"
+            
+            # Early stopping
+            if early_stopping_enabled:
+                if is_best:
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    log_msg += f" (ES patience: {epochs_no_improve}/{early_stopping_patience})"
+                
+                if epochs_no_improve >= early_stopping_patience:
+                    logger.info(f"Early stopping at epoch {epoch + 1}")
+                    early_stopping_triggered = True
+        
+        logger.info(log_msg)
+        
+        if use_scheduler and scheduler:
+            scheduler.step()
+        
+        if early_stopping_triggered:
+            break
+    
+    # Load best model
+    if save_best_model and best_model_state_dict:
+        logger.info(f"Loading best model (metric: {best_metric_val:.4f})")
+        model.load_state_dict(best_model_state_dict)
+    
+    return model, history
+
+
+def evaluate_adaptive_model(model, test_loader, device, criterion=None):
+    """
+    Evaluate an AdaptiveDSSFN model on a test set.
+    
+    Computes classification metrics and adaptive depth statistics.
+    
+    Args:
+        model: AdaptiveDSSFN model instance.
+        test_loader: DataLoader for test data.
+        device: Device to evaluate on.
+        criterion: Loss function (optional, for loss calculation).
+        
+    Returns:
+        Dict with metrics: OA, AA, Kappa, avg_depth, stage_distribution, report.
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    running_loss = 0.0
+    total_depth = 0.0
+    stage_counts = [0, 0, 0]  # Count samples halting at each stage
+    total_samples = 0
+    
+    with torch.no_grad():
+        test_pbar = tqdm(test_loader, desc="Evaluating", leave=False)
+        for inputs, labels in test_pbar:
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            logits, ponder_cost, halting_step = model(inputs, return_ponder_cost=True)
+            
+            if criterion:
+                loss = criterion(logits, labels)
+                running_loss += loss.item() * inputs.size(0)
+            
+            _, predicted = torch.max(logits.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            total_depth += halting_step.float().sum().item()
+            for s in range(1, 4):
+                stage_counts[s - 1] += (halting_step == s).sum().item()
+            total_samples += labels.size(0)
+    
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    if len(all_labels) == 0:
+        logger.warning("Empty evaluation set")
+        return {'OA': 0, 'AA': 0, 'Kappa': 0, 'avg_depth': 0, 'stage_distribution': [0, 0, 0]}
+    
+    # Classification metrics
+    overall_accuracy = accuracy_score(all_labels, all_preds)
+    kappa = cohen_kappa_score(all_labels, all_preds)
+    report_dict = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
+    report_str = classification_report(all_labels, all_preds, zero_division=0)
+    
+    # Average accuracy (per-class)
+    class_accuracies = []
+    for label_val in np.unique(all_labels):
+        label_str = str(label_val)
+        if label_str in report_dict and 'recall' in report_dict[label_str]:
+            class_accuracies.append(report_dict[label_str]['recall'])
+    average_accuracy = np.mean(class_accuracies) if class_accuracies else 0.0
+    
+    # Depth statistics
+    avg_depth = total_depth / total_samples
+    stage_distribution = [c / total_samples for c in stage_counts]
+    flops_reduction = 1.0 - (avg_depth / 3.0)
+    
+    logger.info(f"Overall Accuracy (OA): {overall_accuracy:.4f}")
+    logger.info(f"Average Accuracy (AA): {average_accuracy:.4f}")
+    logger.info(f"Kappa Score: {kappa:.4f}")
+    logger.info(f"Average Depth: {avg_depth:.2f}/3 (FLOPs reduction: {flops_reduction:.1%})")
+    logger.info(f"Stage Distribution: S1={stage_distribution[0]:.1%}, S2={stage_distribution[1]:.1%}, S3={stage_distribution[2]:.1%}")
+    
+    return {
+        'OA': overall_accuracy,
+        'AA': average_accuracy,
+        'Kappa': kappa,
+        'avg_depth': avg_depth,
+        'stage_distribution': stage_distribution,
+        'flops_reduction': flops_reduction,
+        'report': report_str,
+        'all_preds': all_preds,
+        'all_labels': all_labels
+    }
+

@@ -39,11 +39,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals(
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
 module_path = os.path.join(project_root, 'src')
 
-if module_path not in sys.path:
-    print(f"Adding {module_path} to sys.path")
-    sys.path.insert(0, module_path)
+if project_root not in sys.path:
+    print(f"Adding {project_root} to sys.path")
+    sys.path.insert(0, project_root)
 else:
-    print(f"{module_path} already in sys.path")
+    print(f"{project_root} already in sys.path")
 
 # --- Import Custom Modules ---
 try:

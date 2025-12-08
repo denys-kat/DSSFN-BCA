@@ -6,9 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import math
+from typing import Tuple, Optional, List, Dict
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 # Import the building blocks from modules.py using relative import
-from .modules import PyramidalResidualBlock, MultiHeadCrossAttention
+from .modules import PyramidalResidualBlock, MultiHeadCrossAttention, HaltingModule, ACTController
 # Import config to read parameters using relative import
 try:
     from . import config as cfg
@@ -21,7 +25,7 @@ except ImportError:
         SWGMF_TARGET_BANDS = 30 # Example, not directly used by model.py unless passed
         BAND_SELECTION_METHOD = 'SWGMF' # Example
     cfg = MockConfig()
-    logging.warning("Could not import config in model.py, using mock defaults for INTERMEDIATE_ATTENTION_STAGES and FUSION_MECHANISM.")
+    logger.warning("Could not import config in model.py, using mock defaults for INTERMEDIATE_ATTENTION_STAGES and FUSION_MECHANISM.")
 
 
 def _calculate_conv_output_size(input_size, kernel_size, stride, padding):
@@ -154,8 +158,8 @@ class DSSFN(nn.Module):
             # The length should match the output of the initial conv layers.
             self.spec_pos_embedding_s1 = nn.Parameter(torch.randn(1, self.spec_len_s1, dim1) * 0.02)
             self.spat_pos_embedding_s1 = nn.Parameter(torch.randn(1, self.spat_seq_len_s1, dim1) * 0.02)
-            logging.info(f"DSSFN Intermediate Attention ACTIVE after Stage 1 (Heads: {cross_attention_heads}, Dim: {dim1}).")
-            logging.info(f"  Spec Pos Emb S1: (1, {self.spec_len_s1}, {dim1}), Spat Pos Emb S1: (1, {self.spat_seq_len_s1}, {dim1})")
+            logger.info(f"DSSFN Intermediate Attention ACTIVE after Stage 1 (Heads: {cross_attention_heads}, Dim: {dim1}).")
+            logger.info(f"  Spec Pos Emb S1: (1, {self.spec_len_s1}, {dim1}), Spat Pos Emb S1: (1, {self.spat_seq_len_s1}, {dim1})")
 
         if 2 in self.intermediate_stages:
             dim2 = spatial_channels[1] # Channel dimension for stage 2
@@ -165,11 +169,11 @@ class DSSFN(nn.Module):
             # The length should match the output of the inter-stage conv1 layers.
             self.spec_pos_embedding_s2 = nn.Parameter(torch.randn(1, self.spec_len_s2, dim2) * 0.02)
             self.spat_pos_embedding_s2 = nn.Parameter(torch.randn(1, self.spat_seq_len_s2, dim2) * 0.02)
-            logging.info(f"DSSFN Intermediate Attention ACTIVE after Stage 2 (Heads: {cross_attention_heads}, Dim: {dim2}).")
-            logging.info(f"  Spec Pos Emb S2: (1, {self.spec_len_s2}, {dim2}), Spat Pos Emb S2: (1, {self.spat_seq_len_s2}, {dim2})")
+            logger.info(f"DSSFN Intermediate Attention ACTIVE after Stage 2 (Heads: {cross_attention_heads}, Dim: {dim2}).")
+            logger.info(f"  Spec Pos Emb S2: (1, {self.spec_len_s2}, {dim2}), Spat Pos Emb S2: (1, {self.spat_seq_len_s2}, {dim2})")
             
         if not self.intermediate_stages:
-             logging.info("DSSFN Intermediate Attention DISABLED.")
+             logger.info("DSSFN Intermediate Attention DISABLED.")
 
         # --- Final Fusion and Classification Layers ---
         if self.fusion_mechanism == 'AdaptiveWeight':
@@ -180,7 +184,7 @@ class DSSFN(nn.Module):
             
             self.spatial_global_pool = nn.AdaptiveAvgPool2d((1, 1)) # Pool to (B, C, 1, 1)
             self.spatial_fc = nn.Linear(self.final_fusion_dim, num_classes)
-            logging.info("DSSFN using Adaptive Weight Fusion for FINAL fusion (weights determined by engine based on stream losses).")
+            logger.info("DSSFN using Adaptive Weight Fusion for FINAL fusion (weights determined by engine based on stream losses).")
 
         elif self.fusion_mechanism == 'CrossAttention':
             # Final cross-attention fusion before a single classifier
@@ -195,8 +199,8 @@ class DSSFN(nn.Module):
             self.fusion_global_pool = nn.AdaptiveAvgPool1d(1) # Applied after cross-attention and concatenation
             # Input to fusion_fc will be concatenated features from both enhanced streams
             self.fusion_fc = nn.Linear(self.final_fusion_dim * 2, num_classes) 
-            logging.info(f"DSSFN using Bidirectional Cross-Attention Fusion ({cross_attention_heads} heads, Dim: {self.final_fusion_dim}) for FINAL fusion.")
-            logging.info(f"  Spec Pos Emb S3: (1, {self.spec_len_s3}, {self.final_fusion_dim}), Spat Pos Emb S3: (1, {self.spat_seq_len_s3}, {self.final_fusion_dim})")
+            logger.info(f"DSSFN using Bidirectional Cross-Attention Fusion ({cross_attention_heads} heads, Dim: {self.final_fusion_dim}) for FINAL fusion.")
+            logger.info(f"  Spec Pos Emb S3: (1, {self.spec_len_s3}, {self.final_fusion_dim}), Spat Pos Emb S3: (1, {self.spat_seq_len_s3}, {self.final_fusion_dim})")
         else:
             raise ValueError(f"Unsupported final fusion_mechanism: {self.fusion_mechanism}")
 
@@ -378,4 +382,424 @@ class DSSFN(nn.Module):
             return fused_logits
         else:
              raise ValueError(f"Unsupported final fusion_mechanism: {self.fusion_mechanism}")
+
+
+class AdaptiveDSSFN(nn.Module):
+    """
+    Adaptive Depth DSSFN with Adaptive Computation Time (ACT).
+    
+    This model extends DSSFN by adding halting units after each stage,
+    allowing dynamic early exit based on sample difficulty. Easy samples
+    can be classified early (fewer stages), while difficult samples
+    use the full network depth.
+    
+    Key features:
+    - Unified halting: Both spectral and spatial streams halt together
+    - Stage-level granularity: Halting decision after each of 3 stages
+    - Ponder cost regularization: Encourages early halting during training
+    - Compatibility: Uses same building blocks as DSSFN
+    """
+    
+    def __init__(
+        self,
+        input_bands: int,
+        num_classes: int,
+        patch_size: int,
+        spec_channels: List[int] = [64, 128, 256],
+        spatial_channels: List[int] = [64, 128, 256],
+        cross_attention_heads: int = 8,
+        cross_attention_dropout: float = 0.1,
+        act_epsilon: float = 0.01,
+        halting_bias_init: float = -3.0,
+    ):
+        """
+        Initialize the Adaptive DSSFN model.
+        
+        Args:
+            input_bands: Number of input spectral bands (after band selection).
+            num_classes: Number of output classes.
+            patch_size: Spatial size of input patches (e.g., 15 for 15x15).
+            spec_channels: Channel dimensions for 3 spectral stages.
+            spatial_channels: Channel dimensions for 3 spatial stages.
+            cross_attention_heads: Number of heads for intermediate cross-attention.
+            cross_attention_dropout: Dropout rate for cross-attention.
+            act_epsilon: ACT threshold - halt when cumulative_p >= 1 - epsilon.
+            halting_bias_init: Initial bias for halting units (negative = start with low halt prob).
+        """
+        super(AdaptiveDSSFN, self).__init__()
+        
+        # Validate inputs
+        if len(spec_channels) != 3 or len(spatial_channels) != 3:
+            raise ValueError("Channel lists must have length 3.")
+        
+        # Stage 1 and Stage 3 must have matching dimensions for halting
+        # Stage 2 can differ - we use spectral stream for halting there
+        if spec_channels[0] != spatial_channels[0]:
+            raise ValueError(
+                f"AdaptiveDSSFN requires matching Stage 1 dimensions. "
+                f"spec={spec_channels[0]}, spat={spatial_channels[0]}"
+            )
+        if spec_channels[2] != spatial_channels[2]:
+            raise ValueError(
+                f"AdaptiveDSSFN requires matching Stage 3 dimensions. "
+                f"spec={spec_channels[2]}, spat={spatial_channels[2]}"
+            )
+        
+        # Note: Stage 2 can have different dimensions (spec_c2 != spat_c2)
+        # We'll use only spectral features for Stage 2 halting decision
+        self.stage2_dims_match = (spec_channels[1] == spatial_channels[1])
+        
+        self.input_bands = input_bands
+        self.num_classes = num_classes
+        self.patch_size = patch_size
+        self.spec_channels = spec_channels
+        self.spatial_channels = spatial_channels
+        self.num_stages = 3
+        
+        # Read intermediate attention stages from config
+        self.intermediate_stages = cfg.INTERMEDIATE_ATTENTION_STAGES if hasattr(cfg, 'INTERMEDIATE_ATTENTION_STAGES') else []
+        
+        # ACT controller
+        self.act_controller = ACTController(num_stages=3, epsilon=act_epsilon)
+        
+        # ===== Initial Convolutions =====
+        self.spec_conv_in = nn.Conv1d(1, spec_channels[0], kernel_size=3, padding=1, bias=False)
+        self.spec_bn_in = nn.BatchNorm1d(spec_channels[0])
+        self.spec_relu_in = nn.ReLU(inplace=True)
+        
+        self.spatial_conv_in = nn.Conv2d(input_bands, spatial_channels[0], kernel_size=3, padding=1, bias=False)
+        self.spatial_bn_in = nn.BatchNorm2d(spatial_channels[0])
+        self.spatial_relu_in = nn.ReLU(inplace=True)
+        
+        # ===== Stage 1 =====
+        self.spec_stage1 = PyramidalResidualBlock(spec_channels[0], spec_channels[0], is_1d=True)
+        self.spatial_stage1 = PyramidalResidualBlock(spatial_channels[0], spatial_channels[0], is_1d=False)
+        
+        # Halting unit after Stage 1 (uses combined/fused features)
+        # We'll pool both streams and concatenate for halting decision
+        self.halting_unit_s1 = HaltingModule(spec_channels[0], is_1d=True, init_bias=halting_bias_init)
+        
+        # Classifier head for Stage 1 early exit
+        self.classifier_s1 = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(spec_channels[0], num_classes)
+        )
+        
+        # ===== Inter-stage convolutions 1->2 =====
+        self.spec_conv1 = nn.Conv1d(spec_channels[0], spec_channels[1], kernel_size=3, stride=2, padding=1, bias=False)
+        self.spec_bn1 = nn.BatchNorm1d(spec_channels[1])
+        self.spatial_conv1 = nn.Conv2d(spatial_channels[0], spatial_channels[1], kernel_size=3, stride=2, padding=1, bias=False)
+        self.spatial_bn1 = nn.BatchNorm2d(spatial_channels[1])
+        
+        # ===== Stage 2 =====
+        self.spec_stage2 = PyramidalResidualBlock(spec_channels[1], spec_channels[1], is_1d=True)
+        self.spatial_stage2 = PyramidalResidualBlock(spatial_channels[1], spatial_channels[1], is_1d=False)
+        
+        # Halting unit after Stage 2
+        self.halting_unit_s2 = HaltingModule(spec_channels[1], is_1d=True, init_bias=halting_bias_init)
+        
+        # Classifier head for Stage 2 early exit
+        self.classifier_s2 = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(spec_channels[1], num_classes)
+        )
+        
+        # ===== Inter-stage convolutions 2->3 =====
+        self.spec_conv2 = nn.Conv1d(spec_channels[1], spec_channels[2], kernel_size=3, stride=2, padding=1, bias=False)
+        self.spec_bn2 = nn.BatchNorm1d(spec_channels[2])
+        self.spatial_conv2 = nn.Conv2d(spatial_channels[1], spatial_channels[2], kernel_size=3, stride=2, padding=1, bias=False)
+        self.spatial_bn2 = nn.BatchNorm2d(spatial_channels[2])
+        
+        # ===== Stage 3 =====
+        self.spec_stage3 = PyramidalResidualBlock(spec_channels[2], spec_channels[2], is_1d=True)
+        self.spatial_stage3 = PyramidalResidualBlock(spatial_channels[2], spatial_channels[2], is_1d=False)
+        
+        # Final classifier (no halting unit after Stage 3 - always use this if we reach here)
+        self.classifier_s3 = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(spec_channels[2], num_classes)
+        )
+        
+        # ===== Intermediate Cross-Attention (optional, from config) =====
+        self._setup_intermediate_attention(cross_attention_heads, cross_attention_dropout)
+        
+        logger.info(f"AdaptiveDSSFN initialized: {num_classes} classes, ACT epsilon={act_epsilon}")
+        logger.info(f"  Channels: {spec_channels}")
+        logger.info(f"  Intermediate attention stages: {self.intermediate_stages}")
+    
+    def _setup_intermediate_attention(self, heads: int, dropout: float):
+        """Setup intermediate cross-attention modules if configured."""
+        # Calculate sequence lengths for positional embeddings
+        self.spec_len_s1 = self.input_bands  # After initial conv (stride=1)
+        self.spat_seq_len_s1 = self.patch_size * self.patch_size
+        
+        self.spec_len_s2 = (self.spec_len_s1 + 1) // 2  # After stride-2 conv
+        self.spat_h_s2 = (self.patch_size + 1) // 2
+        self.spat_seq_len_s2 = self.spat_h_s2 * self.spat_h_s2
+        
+        # Intermediate attention after Stage 1
+        self.intermediate_spec_enhancer_s1 = None
+        self.intermediate_spat_enhancer_s1 = None
+        self.spec_pos_embedding_s1 = None
+        self.spat_pos_embedding_s1 = None
+        
+        if 1 in self.intermediate_stages:
+            dim1 = self.spec_channels[0]
+            self.intermediate_spec_enhancer_s1 = MultiHeadCrossAttention(dim1, heads, dropout)
+            self.intermediate_spat_enhancer_s1 = MultiHeadCrossAttention(dim1, heads, dropout)
+            self.spec_pos_embedding_s1 = nn.Parameter(torch.randn(1, self.spec_len_s1, dim1) * 0.02)
+            self.spat_pos_embedding_s1 = nn.Parameter(torch.randn(1, self.spat_seq_len_s1, dim1) * 0.02)
+            logger.info(f"  Intermediate attention after Stage 1: heads={heads}, dim={dim1}")
+        
+        # Intermediate attention after Stage 2
+        self.intermediate_spec_enhancer_s2 = None
+        self.intermediate_spat_enhancer_s2 = None
+        self.spec_pos_embedding_s2 = None
+        self.spat_pos_embedding_s2 = None
+        
+        if 2 in self.intermediate_stages:
+            # Skip Stage 2 attention if dimensions don't match
+            if not self.stage2_dims_match:
+                logger.warning(f"  Skipping Stage 2 intermediate attention: spec={self.spec_channels[1]}, spat={self.spatial_channels[1]} (dimensions don't match)")
+            else:
+                dim2 = self.spec_channels[1]
+                self.intermediate_spec_enhancer_s2 = MultiHeadCrossAttention(dim2, heads, dropout)
+                self.intermediate_spat_enhancer_s2 = MultiHeadCrossAttention(dim2, heads, dropout)
+                self.spec_pos_embedding_s2 = nn.Parameter(torch.randn(1, self.spec_len_s2, dim2) * 0.02)
+                self.spat_pos_embedding_s2 = nn.Parameter(torch.randn(1, self.spat_seq_len_s2, dim2) * 0.02)
+                logger.info(f"  Intermediate attention after Stage 2: heads={heads}, dim={dim2}")
+    
+    def _apply_intermediate_attention(self, spc: torch.Tensor, spt: torch.Tensor, stage: int):
+        """Apply bidirectional cross-attention between streams at a given stage."""
+        if stage == 1:
+            if self.intermediate_spec_enhancer_s1 is None:
+                return spc, spt
+            spec_enhancer = self.intermediate_spec_enhancer_s1
+            spat_enhancer = self.intermediate_spat_enhancer_s1
+            spec_pos = self.spec_pos_embedding_s1
+            spat_pos = self.spat_pos_embedding_s1
+        elif stage == 2:
+            if self.intermediate_spec_enhancer_s2 is None:
+                return spc, spt
+            spec_enhancer = self.intermediate_spec_enhancer_s2
+            spat_enhancer = self.intermediate_spat_enhancer_s2
+            spec_pos = self.spec_pos_embedding_s2
+            spat_pos = self.spat_pos_embedding_s2
+        else:
+            return spc, spt
+        
+        # Reshape for attention
+        B, C, L = spc.shape
+        spc_reshaped = spc.permute(0, 2, 1)  # (B, L, C)
+        
+        B, C, H, W = spt.shape
+        spt_reshaped = spt.view(B, C, H * W).permute(0, 2, 1)  # (B, H*W, C)
+        
+        # Add positional embeddings
+        L_slice = min(L, spec_pos.shape[1])
+        N_slice = min(H * W, spat_pos.shape[1])
+        
+        spc_with_pos = spc_reshaped[:, :L_slice, :] + spec_pos[:, :L_slice, :]
+        spt_with_pos = spt_reshaped[:, :N_slice, :] + spat_pos[:, :N_slice, :]
+        
+        # Cross-attention
+        spc_enhanced = spec_enhancer(spc_with_pos, spt_with_pos)
+        spt_enhanced = spat_enhancer(spt_with_pos, spc_with_pos)
+        
+        # Reshape back
+        spc_out = spc_enhanced.permute(0, 2, 1)  # (B, C, L_slice)
+        if L_slice < L:
+            spc_out = F.pad(spc_out, (0, L - L_slice))
+        
+        spt_out = spt_enhanced.permute(0, 2, 1)  # (B, C, N_slice)
+        if N_slice < H * W:
+            spt_out = F.pad(spt_out, (0, H * W - N_slice))
+        spt_out = spt_out.view(B, C, H, W)
+        
+        return spc_out, spt_out
+    
+    def _fuse_features_for_halting(self, spc: torch.Tensor, spt: torch.Tensor) -> torch.Tensor:
+        """
+        Fuse spectral and spatial features for unified halting decision.
+        
+        For simplicity, we use the spectral features (already pooled by halting unit)
+        as they are lower-dimensional and capture the essential spectral signature.
+        """
+        # The halting unit handles pooling internally
+        return spc
+    
+    def _fuse_features_for_classification(self, spc: torch.Tensor, spt: torch.Tensor, 
+                                          stage: int = 0) -> torch.Tensor:
+        """
+        Combine spectral and spatial features for classification at a given stage.
+        
+        If dimensions match, we average the pooled features from both streams.
+        If dimensions don't match (Stage 2 case), we use only the spectral features.
+        
+        Args:
+            spc: Spectral features (B, C_spec, L)
+            spt: Spatial features (B, C_spat, H, W)
+            stage: Current stage (1, 2, or 3)
+        """
+        # Pool spatial features 
+        spt_pooled = F.adaptive_avg_pool2d(spt, 1).flatten(2)  # (B, C_spat, 1)
+        
+        # Check if dimensions match
+        if spc.shape[1] == spt_pooled.shape[1]:
+            # Average the two streams
+            combined = (spc + spt_pooled) / 2.0
+        else:
+            # Dimensions don't match (e.g., Stage 2 with different spec_c2 and spat_c2)
+            # Use only spectral features for consistency
+            combined = spc
+        
+        return combined
+    
+    def forward(
+        self,
+        x_spatial: torch.Tensor,
+        return_ponder_cost: bool = True
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Forward pass with adaptive depth.
+        
+        Args:
+            x_spatial: Input patches (B, NumBands, PatchH, PatchW).
+            return_ponder_cost: If True, compute and return ponder cost for loss.
+            
+        Returns:
+            Tuple of:
+                - logits: (B, num_classes) - Final class predictions
+                - ponder_cost: (B,) - Stages used per sample (for loss), or None
+                - halting_step: (B,) - Which stage each sample halted at, or None
+        """
+        B = x_spatial.shape[0]
+        device = x_spatial.device
+        
+        # ===== Initial Feature Extraction =====
+        # Spatial stream
+        spt = self.spatial_relu_in(self.spatial_bn_in(self.spatial_conv_in(x_spatial)))
+        
+        # Spectral stream: extract center pixel
+        center = self.patch_size // 2
+        x_spectral = x_spatial[:, :, center, center].unsqueeze(1)  # (B, 1, NumBands)
+        spc = self.spec_relu_in(self.spec_bn_in(self.spec_conv_in(x_spectral)))
+        
+        # Storage for ACT
+        stage_logits = []
+        halting_probs = []
+        
+        # ===== Stage 1 =====
+        spc_s1 = self.spec_stage1(spc)
+        spt_s1 = self.spatial_stage1(spt)
+        
+        # Apply intermediate attention if configured
+        if 1 in self.intermediate_stages:
+            spc_s1, spt_s1 = self._apply_intermediate_attention(spc_s1, spt_s1, 1)
+        
+        # Fuse for halting decision and classification
+        fused_s1 = self._fuse_features_for_classification(spc_s1, spt_s1)
+        logits_s1 = self.classifier_s1(fused_s1)
+        halt_prob_s1 = self.halting_unit_s1(spc_s1)
+        
+        stage_logits.append(logits_s1)
+        halting_probs.append(halt_prob_s1)
+        
+        # ===== Stage 2 =====
+        spc_s2_in = F.relu(self.spec_bn1(self.spec_conv1(spc_s1)))
+        spt_s2_in = F.relu(self.spatial_bn1(self.spatial_conv1(spt_s1)))
+        
+        spc_s2 = self.spec_stage2(spc_s2_in)
+        spt_s2 = self.spatial_stage2(spt_s2_in)
+        
+        # Apply intermediate attention if configured
+        if 2 in self.intermediate_stages:
+            spc_s2, spt_s2 = self._apply_intermediate_attention(spc_s2, spt_s2, 2)
+        
+        # Fuse for halting decision and classification
+        fused_s2 = self._fuse_features_for_classification(spc_s2, spt_s2)
+        logits_s2 = self.classifier_s2(fused_s2)
+        halt_prob_s2 = self.halting_unit_s2(spc_s2)
+        
+        stage_logits.append(logits_s2)
+        halting_probs.append(halt_prob_s2)
+        
+        # ===== Stage 3 =====
+        spc_s3_in = F.relu(self.spec_bn2(self.spec_conv2(spc_s2)))
+        spt_s3_in = F.relu(self.spatial_bn2(self.spatial_conv2(spt_s2)))
+        
+        spc_s3 = self.spec_stage3(spc_s3_in)
+        spt_s3 = self.spatial_stage3(spt_s3_in)
+        
+        # No halting after Stage 3 - this is the final stage
+        fused_s3 = self._fuse_features_for_classification(spc_s3, spt_s3)
+        logits_s3 = self.classifier_s3(fused_s3)
+        
+        # For ACT, Stage 3 halting prob is implicitly 1.0 (always halt if reached)
+        halt_prob_s3 = torch.ones(B, 1, device=device)
+        
+        stage_logits.append(logits_s3)
+        halting_probs.append(halt_prob_s3)
+        
+        # ===== Apply ACT to combine stage outputs =====
+        if return_ponder_cost:
+            weighted_logits, ponder_cost, halting_step, _ = self.act_controller.compute_act_output(
+                stage_logits, halting_probs
+            )
+            return weighted_logits, ponder_cost, halting_step
+        else:
+            # During inference without ACT tracking, just use the ACT-weighted output
+            weighted_logits, _, halting_step, _ = self.act_controller.compute_act_output(
+                stage_logits, halting_probs
+            )
+            return weighted_logits, None, halting_step
+    
+    def forward_fixed_depth(self, x_spatial: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass using fixed full depth (no early exit).
+        
+        Useful for comparison with adaptive depth.
+        
+        Args:
+            x_spatial: Input patches (B, NumBands, PatchH, PatchW).
+            
+        Returns:
+            logits: (B, num_classes) - Class predictions from Stage 3.
+        """
+        B = x_spatial.shape[0]
+        
+        # Initial feature extraction
+        spt = self.spatial_relu_in(self.spatial_bn_in(self.spatial_conv_in(x_spatial)))
+        center = self.patch_size // 2
+        x_spectral = x_spatial[:, :, center, center].unsqueeze(1)
+        spc = self.spec_relu_in(self.spec_bn_in(self.spec_conv_in(x_spectral)))
+        
+        # Stage 1
+        spc = self.spec_stage1(spc)
+        spt = self.spatial_stage1(spt)
+        if 1 in self.intermediate_stages:
+            spc, spt = self._apply_intermediate_attention(spc, spt, 1)
+        
+        # Stage 2
+        spc = F.relu(self.spec_bn1(self.spec_conv1(spc)))
+        spt = F.relu(self.spatial_bn1(self.spatial_conv1(spt)))
+        spc = self.spec_stage2(spc)
+        spt = self.spatial_stage2(spt)
+        if 2 in self.intermediate_stages:
+            spc, spt = self._apply_intermediate_attention(spc, spt, 2)
+        
+        # Stage 3
+        spc = F.relu(self.spec_bn2(self.spec_conv2(spc)))
+        spt = F.relu(self.spatial_bn2(self.spatial_conv2(spt)))
+        spc = self.spec_stage3(spc)
+        spt = self.spatial_stage3(spt)
+        
+        # Final classification
+        fused = self._fuse_features_for_classification(spc, spt)
+        logits = self.classifier_s3(fused)
+        
+        return logits
 

@@ -221,3 +221,178 @@ class PyramidalResidualBlock(nn.Module):
         out += identity
         out = self.relu2(out)
         return out
+
+
+class HaltingModule(nn.Module):
+    """
+    Halting Module for Adaptive Computation Time (ACT).
+    Predicts a halting probability for the current state.
+    
+    Based on Graves (2016) "Adaptive Computation Time for Recurrent Neural Networks".
+    """
+    def __init__(self, in_channels, is_1d=False, init_bias=-3.0):
+        """
+        Args:
+            in_channels (int): Number of input channels.
+            is_1d (bool): True for spectral (1D), False for spatial (2D).
+            init_bias (float): Initial bias for halting FC layer. Negative values
+                              encourage low initial halting probability (more computation).
+        """
+        super(HaltingModule, self).__init__()
+        self.is_1d = is_1d
+        self.in_channels = in_channels
+        self.pool = nn.AdaptiveAvgPool1d(1) if is_1d else nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(in_channels, 1)
+        self.sigmoid = nn.Sigmoid()
+        
+        # Initialize bias to a negative value to encourage starting with low halting probability
+        nn.init.constant_(self.fc.bias, init_bias)
+        # Xavier init for weights
+        nn.init.xavier_uniform_(self.fc.weight)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input feature map. Shape: (B, C, L) for 1D or (B, C, H, W) for 2D.
+        Returns:
+            torch.Tensor: Halting probability (B, 1), values in [0, 1].
+        """
+        # Global Average Pooling
+        y = self.pool(x)  # (B, C, 1) or (B, C, 1, 1)
+        y = y.flatten(1)  # (B, C)
+        
+        # Predict probability
+        p = self.sigmoid(self.fc(y))  # (B, 1)
+        return p
+
+
+class ACTController:
+    """
+    Adaptive Computation Time Controller.
+    
+    Manages the halting logic across multiple stages, computing weighted
+    outputs and tracking ponder cost for the loss function.
+    
+    The ACT mechanism allows early exit when cumulative halting probability
+    exceeds (1 - epsilon), distributing computation adaptively per sample.
+    """
+    
+    def __init__(self, num_stages: int = 3, epsilon: float = 0.01):
+        """
+        Args:
+            num_stages: Maximum number of stages/blocks.
+            epsilon: Halting threshold. Model halts when cumulative_p >= 1 - epsilon.
+        """
+        self.num_stages = num_stages
+        self.epsilon = epsilon
+        self.threshold = 1.0 - epsilon
+    
+    def compute_act_output(
+        self,
+        stage_outputs: list,
+        halting_probs: list,
+    ):
+        """
+        Compute the ACT-weighted output from stage outputs and halting probabilities.
+        
+        This implements the core ACT algorithm:
+        1. Accumulate halting probabilities until threshold is reached
+        2. Compute remainder for final stage
+        3. Weight each stage's output by its contribution
+        
+        Args:
+            stage_outputs: List of tensors, one per stage. Each: (B, ...) - feature maps or logits
+            halting_probs: List of tensors (B, 1), halting probability at each stage
+            
+        Returns:
+            Tuple of:
+                - weighted_output: (B, ...) - ACT-weighted combination of stage outputs
+                - ponder_cost: (B,) - Number of stages used per sample (for loss)
+                - halting_step: (B,) - Which stage each sample halted at
+                - stage_weights: List of (B, 1) - Weight given to each stage
+        """
+        batch_size = stage_outputs[0].shape[0]
+        device = stage_outputs[0].device
+        output_shape = stage_outputs[0].shape[1:]
+        
+        # Initialize accumulators
+        cumulative_prob = torch.zeros(batch_size, 1, device=device)
+        weighted_output = torch.zeros(batch_size, *output_shape, device=device)
+        ponder_cost = torch.zeros(batch_size, device=device)
+        halting_step = torch.zeros(batch_size, dtype=torch.long, device=device)
+        stage_weights = []
+        
+        # Track which samples are still active (haven't halted yet)
+        active = torch.ones(batch_size, dtype=torch.bool, device=device)
+        
+        for t, (output_t, p_t) in enumerate(zip(stage_outputs, halting_probs)):
+            stage_idx = t + 1  # 1-indexed stage number
+            
+            # Check if this is the last stage
+            is_last_stage = (stage_idx == self.num_stages)
+            
+            # For active samples, check if we should halt
+            should_halt = active & ((cumulative_prob.squeeze(-1) + p_t.squeeze(-1)) >= self.threshold)
+            
+            # Compute weights for this stage
+            # If halting: remainder = 1 - cumulative_prob
+            # If continuing: weight = p_t
+            # If last stage: remainder for all still active
+            
+            weight_t = torch.zeros(batch_size, 1, device=device)
+            
+            if is_last_stage:
+                # Last stage gets all remaining probability for active samples
+                remainder = (1.0 - cumulative_prob) * active.unsqueeze(-1).float()
+                weight_t = remainder
+                halting_step[active] = stage_idx
+            else:
+                # Samples that halt here get remainder as weight
+                remainder = (1.0 - cumulative_prob) * should_halt.unsqueeze(-1).float()
+                weight_t = weight_t + remainder
+                halting_step[should_halt] = stage_idx
+                
+                # Samples that continue get p_t as weight
+                continuing = active & ~should_halt
+                weight_t = weight_t + p_t * continuing.unsqueeze(-1).float()
+            
+            # Accumulate weighted output
+            # Expand weight to match output dimensions
+            weight_expanded = weight_t
+            for _ in range(len(output_shape) - 1):
+                weight_expanded = weight_expanded.unsqueeze(-1)
+            if len(output_shape) > 0:
+                weight_expanded = weight_expanded.expand_as(output_t)
+            
+            weighted_output = weighted_output + weight_expanded * output_t
+            
+            # Update cumulative probability for continuing samples
+            if not is_last_stage:
+                continuing = active & ~should_halt
+                cumulative_prob = cumulative_prob + p_t * continuing.unsqueeze(-1).float()
+                # Update active mask
+                active = active & ~should_halt
+            
+            # Track ponder cost (how many stages each sample uses)
+            ponder_cost = ponder_cost + active.float()
+            
+            stage_weights.append(weight_t)
+        
+        # Ponder cost is the sum of "did we process this stage" for each sample
+        # Minimum is 1 (always process at least one stage)
+        ponder_cost = ponder_cost.clamp(min=1.0)
+        
+        return weighted_output, ponder_cost, halting_step, stage_weights
+    
+    def compute_ponder_loss(self, ponder_cost: torch.Tensor) -> torch.Tensor:
+        """
+        Compute ponder loss (regularization term encouraging early halting).
+        
+        Args:
+            ponder_cost: (B,) tensor of stages used per sample
+            
+        Returns:
+            Scalar tensor - mean ponder cost across batch
+        """
+        return ponder_cost.mean()
+
