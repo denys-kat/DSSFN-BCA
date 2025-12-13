@@ -187,3 +187,29 @@ print(f"Data will be loaded from: {DATA_PATH}")
 print(f"Number of classes: {NUM_CLASSES}")
 if EARLY_STOPPING_ENABLED:
     print(f"Early stopping enabled: Patience={EARLY_STOPPING_PATIENCE}, Metric='{EARLY_STOPPING_METRIC}', MinDelta={EARLY_STOPPING_MIN_DELTA}")
+
+# --- MODEL PRESETS ---
+MODEL_PRESETS = {
+    "base": {
+        "s1_channels": 64,
+        "spec_c2": 128,
+        "spat_c2": 128,
+        "s3_channels": 256,
+        "swgmf_bands": 30,
+        "band_selection": "SWGMF",
+        "intermediate_attention": [],
+        "fusion_mechanism": "AdaptiveWeight",
+        "cross_attention_heads": 8
+    },
+    "bca": {
+        "s1_channels": 64,
+        "spec_c2": 128,
+        "spat_c2": 128,
+        "s3_channels": 256,
+        "efdpc_dc_percent": 2.5,
+        "band_selection": "E-FDPC",
+        "intermediate_attention": [1],
+        "fusion_mechanism": "AdaptiveWeight",
+        "cross_attention_heads": 8
+    }
+}

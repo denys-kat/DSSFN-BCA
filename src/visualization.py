@@ -1,17 +1,18 @@
 # src/visualization.py
 # Contains functions for plotting training history and classification maps.
+# RESTORED TO "OLD" STYLE (Pastel colors, Colorbar) per user request.
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import matplotlib # Base import sometimes needed for colormaps dictionary access
+import matplotlib
 import numpy as np
+
 # Need config for dataset name in plot_predictions title fallback
 try:
     from . import config as cfg # Use relative import
 except ImportError:
     cfg = None # Handle case where config might not be importable directly
-    print("Warning: Could not import config via relative import in visualization.py")
-
+    # print("Warning: Could not import config via relative import in visualization.py")
 
 def plot_history(history):
     """
@@ -67,33 +68,27 @@ def plot_history(history):
     ax2.set_title('Model Accuracy')
     ax2.set_ylabel('Accuracy')
     ax2.set_xlabel('Epoch')
-    # Set y-axis limits for accuracy if desired (e.g., 0 to 1)
-    # ax2.set_ylim(bottom=0, top=1.05) 
     ax2.legend()
     ax2.grid(True)
 
-
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
-    # plt.show() # Don't show in script, just return fig/axes
-
     return fig, axes
 
 
-def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset_name="Dataset", oa=None):
+def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset_name="Dataset", oa=None, subtitle="Predicted Classification"):
     """
-    Generates and displays the ground truth map and the predicted classification map
-    for the test set pixels.
+    Generates and displays the ground truth map and the predicted classification map.
+    Uses 'tab20' or 'gist_ncar' for professional, distinct colors and a standard colorbar.
 
     Args:
         gt_map (np.ndarray): The original ground truth map (H, W). Labels > 0.
         test_predictions (np.ndarray): 1D array of predicted labels (0-indexed) for test pixels.
         test_coords (list): List of coordinate dicts [{'r': r, 'c': c}, ...] for test pixels,
                               corresponding to test_predictions. 'r', 'c' are original indices.
-        class_names (list): List of class names, where index 0 is assumed to be
-                             "Background / Not Tested" and indices 1 to N correspond
-                             to the original labels 1 to N in gt_map (and predictions+1).
+        class_names (list): List of class names. Index 0 is Background.
         dataset_name (str): Name of the dataset for the title.
-        oa (float, optional): Overall accuracy to display in the title. Defaults to None.
+        oa (float, optional): Overall accuracy to display in the title.
+        subtitle (str): Subtitle for the prediction plot (e.g., "Full Map" or "Test Only").
 
     Returns:
         tuple: (fig, axes) The matplotlib figure and axes objects. Returns (None, None) if plotting fails.
@@ -122,25 +117,19 @@ def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset
     # Prediction Display Map: Initialize with 0 (represents Background/Not Tested)
     test_prediction_map_display = np.zeros((H, W), dtype=np.int32)
 
-    print(f"Populating prediction map for {len(test_coords)} test pixels...")
     # Populate map using the coordinates and the 0-indexed predictions
     for i, coord in enumerate(test_coords):
         r, c = coord['r'], coord['c']
         # Assign evaluated prediction + 1 (Map model output 0-(N-1) to display values 1-N)
         predicted_class_index = test_predictions[i] # 0 to N-1
-        # Ensure predicted index is valid before adding 1
+        
         if 0 <= predicted_class_index < num_classes:
             display_value = predicted_class_index + 1   # 1 to N
         else:
-            print(f"Warning: Invalid predicted class index ({predicted_class_index}) for coord ({r}, {c}). Setting display to 0.")
             display_value = 0 # Assign to background/unknown
 
         if 0 <= r < H and 0 <= c < W:
              test_prediction_map_display[r, c] = display_value
-        else:
-             print(f"Warning: Coordinate ({r}, {c}) out of bounds for gt_map shape ({H}, {W}). Skipping.")
-
-    print("Prediction map populated.")
 
     # --- Visualization Setup ---
     # Define Colors: 1 for Background/Not Tested (Black), N for classes
@@ -150,9 +139,11 @@ def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset
              print("Error: Number of classes is zero or negative. Cannot create colormap.")
              return None, None
         elif num_classes <= 20:
+             # This is the "Nice" pastel palette you liked
              cmap_base = matplotlib.colormaps['tab20']
              class_colors_rgba = cmap_base(np.linspace(0, 1, num_classes))
-        else: # Use a map with more colors for > 20 classes
+        else: 
+             # Use a map with more colors for > 20 classes
              cmap_base = matplotlib.colormaps['gist_ncar']
              class_colors_rgba = cmap_base(np.linspace(0, 1, num_classes))
     except Exception as e: # Fallback for different matplotlib versions/names
@@ -168,12 +159,8 @@ def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset
     colors.extend([tuple(c) for c in class_colors_rgba]) # Add N class colors for values 1 to N
 
     if len(colors) != num_vis_entries:
-        print(f"WARNING: Number of colors ({len(colors)}) does not match number of visual entries ({num_vis_entries}). Adjusting.")
-        # Adjust if necessary, though it should match num_classes + 1
-        colors = colors[:num_vis_entries]
-        if len(colors) < num_vis_entries: # Pad with default if too short
-             colors.extend([(0.5, 0.5, 0.5, 1.0)] * (num_vis_entries - len(colors)))
-
+        # Pad with default if too short
+        colors.extend([(0.5, 0.5, 0.5, 1.0)] * (num_vis_entries - len(colors)))
 
     custom_cmap = mcolors.ListedColormap(colors)
     # Bounds map values [0, 1, ..., N] to indices [0, 1, ..., N] for the colormap
@@ -181,7 +168,6 @@ def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset
     norm = mcolors.BoundaryNorm(bounds, custom_cmap.N) # N should be num_vis_entries
 
     # --- Plotting ---
-    print("Generating plots...")
     fig, axes = plt.subplots(1, 2, figsize=(12, 6)) # axes is now a numpy array [ax1, ax2]
 
     # Ground Truth Map (values 0-N)
@@ -191,7 +177,7 @@ def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset
 
     # Predicted Map (values 0 for Untested/Bg, 1-N for tested classes)
     im = axes[1].imshow(test_prediction_map_display, cmap=custom_cmap, norm=norm, interpolation='none')
-    axes[1].set_title("Predicted Classification (Test Set Pixels Only)")
+    axes[1].set_title(subtitle)
     axes[1].axis('off')
 
     # Add Colorbar Legend
@@ -215,7 +201,5 @@ def plot_predictions(gt_map, test_predictions, test_coords, class_names, dataset
     if oa is not None:
         title += f" (OA: {oa:.4f})"
     plt.suptitle(title, fontsize=14)
-
-    # plt.show() # Don't show in script
 
     return fig, axes
