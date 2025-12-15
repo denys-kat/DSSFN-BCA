@@ -56,7 +56,24 @@ class DSSFN(nn.Module):
         self.patch_size = patch_size
         self.spec_channels = spec_channels
         self.spatial_channels = spatial_channels
-        self.intermediate_stages = intermediate_attention_stages
+        # Normalize stages defensively: allow callers to pass strings like "1" from JSON.
+        stages_in = intermediate_attention_stages
+        if stages_in is None:
+            stages_in = []
+        if isinstance(stages_in, (int, float, str)):
+            stages_in = [stages_in]
+        stages_norm: List[int] = []
+        try:
+            for s in list(stages_in):
+                try:
+                    si = int(s)
+                except Exception:
+                    continue
+                if si in (1, 2):
+                    stages_norm.append(si)
+        except Exception:
+            stages_norm = []
+        self.intermediate_stages = sorted(set(stages_norm))
         
         # Enforce AdaptiveWeight default if None or invalid is passed
         if fusion_mechanism != 'AdaptiveWeight':
@@ -315,7 +332,24 @@ class AdaptiveDSSFN(nn.Module):
         self.spatial_channels = spatial_channels
         self.num_stages = 3
         
-        self.intermediate_stages = intermediate_attention_stages
+        # Normalize stages defensively (same rationale as DSSFN).
+        stages_in = intermediate_attention_stages
+        if stages_in is None:
+            stages_in = []
+        if isinstance(stages_in, (int, float, str)):
+            stages_in = [stages_in]
+        stages_norm: List[int] = []
+        try:
+            for s in list(stages_in):
+                try:
+                    si = int(s)
+                except Exception:
+                    continue
+                if si in (1, 2):
+                    stages_norm.append(si)
+        except Exception:
+            stages_norm = []
+        self.intermediate_stages = sorted(set(stages_norm))
         
         # ACT controller
         self.act_controller = ACTController(num_stages=3, epsilon=act_epsilon)
@@ -464,75 +498,194 @@ class AdaptiveDSSFN(nn.Module):
         else:
             combined = spc
         return combined
-    
-    def forward(self, x_spatial: torch.Tensor, return_ponder_cost: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        B = x_spatial.shape[0]
-        device = x_spatial.device
-        
+
+    def forward_stage_logits(self, x_spatial: torch.Tensor, stage: int) -> torch.Tensor:
+        """
+        Returns the logits produced at a specific stage without ACT weighting.
+        This is used for deterministic per-stage FLOPs measurement.
+        """
+        if stage not in (1, 2, 3):
+            raise ValueError(f"stage must be 1, 2, or 3 (got {stage})")
+
         spt = self.spatial_relu_in(self.spatial_bn_in(self.spatial_conv_in(x_spatial)))
         center = self.patch_size // 2
         x_spectral = x_spatial[:, :, center, center].unsqueeze(1)
         spc = self.spec_relu_in(self.spec_bn_in(self.spec_conv_in(x_spectral)))
-        
-        stage_logits = []
-        halting_probs = []
-        
-        # ===== Stage 1 =====
+
+        # Stage 1
         spc_s1 = self.spec_stage1(spc)
         spt_s1 = self.spatial_stage1(spt)
-        
         if 1 in self.intermediate_stages:
             spc_s1, spt_s1 = self._apply_intermediate_attention(spc_s1, spt_s1, 1)
-        
-        fused_s1 = self._fuse_features_for_classification(spc_s1, spt_s1)
-        logits_s1 = self.classifier_s1(fused_s1)
-        halt_prob_s1 = self.halting_unit_s1(spc_s1)
-        
-        stage_logits.append(logits_s1)
-        halting_probs.append(halt_prob_s1)
-        
-        # ===== Stage 2 =====
+        logits_s1 = self.classifier_s1(self._fuse_features_for_classification(spc_s1, spt_s1))
+        if stage == 1:
+            return logits_s1
+
+        # Stage 2
         spc_s2_in = F.relu(self.spec_bn1(self.spec_conv1(spc_s1)))
         spt_s2_in = F.relu(self.spatial_bn1(self.spatial_conv1(spt_s1)))
-        
         spc_s2 = self.spec_stage2(spc_s2_in)
         spt_s2 = self.spatial_stage2(spt_s2_in)
-        
         if 2 in self.intermediate_stages:
             spc_s2, spt_s2 = self._apply_intermediate_attention(spc_s2, spt_s2, 2)
-        
-        fused_s2 = self._fuse_features_for_classification(spc_s2, spt_s2)
-        logits_s2 = self.classifier_s2(fused_s2)
-        halt_prob_s2 = self.halting_unit_s2(spc_s2)
-        
-        stage_logits.append(logits_s2)
-        halting_probs.append(halt_prob_s2)
-        
-        # ===== Stage 3 =====
+        logits_s2 = self.classifier_s2(self._fuse_features_for_classification(spc_s2, spt_s2))
+        if stage == 2:
+            return logits_s2
+
+        # Stage 3
         spc_s3_in = F.relu(self.spec_bn2(self.spec_conv2(spc_s2)))
         spt_s3_in = F.relu(self.spatial_bn2(self.spatial_conv2(spt_s2)))
-        
         spc_s3 = self.spec_stage3(spc_s3_in)
         spt_s3 = self.spatial_stage3(spt_s3_in)
-        
-        fused_s3 = self._fuse_features_for_classification(spc_s3, spt_s3)
-        logits_s3 = self.classifier_s3(fused_s3)
-        
+        logits_s3 = self.classifier_s3(self._fuse_features_for_classification(spc_s3, spt_s3))
+        return logits_s3
+
+    def _forward_act_soft(self, x_spatial: torch.Tensor, return_ponder_cost: bool) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """
+        Differentiable ACT path (computes all stages, used for training).
+        """
+        B = x_spatial.shape[0]
+        device = x_spatial.device
+
+        spt = self.spatial_relu_in(self.spatial_bn_in(self.spatial_conv_in(x_spatial)))
+        center = self.patch_size // 2
+        x_spectral = x_spatial[:, :, center, center].unsqueeze(1)
+        spc = self.spec_relu_in(self.spec_bn_in(self.spec_conv_in(x_spectral)))
+
+        stage_logits = []
+        halting_probs = []
+
+        # Stage 1
+        spc_s1 = self.spec_stage1(spc)
+        spt_s1 = self.spatial_stage1(spt)
+        if 1 in self.intermediate_stages:
+            spc_s1, spt_s1 = self._apply_intermediate_attention(spc_s1, spt_s1, 1)
+        logits_s1 = self.classifier_s1(self._fuse_features_for_classification(spc_s1, spt_s1))
+        halt_prob_s1 = self.halting_unit_s1(spc_s1)
+        stage_logits.append(logits_s1)
+        halting_probs.append(halt_prob_s1)
+
+        # Stage 2
+        spc_s2_in = F.relu(self.spec_bn1(self.spec_conv1(spc_s1)))
+        spt_s2_in = F.relu(self.spatial_bn1(self.spatial_conv1(spt_s1)))
+        spc_s2 = self.spec_stage2(spc_s2_in)
+        spt_s2 = self.spatial_stage2(spt_s2_in)
+        if 2 in self.intermediate_stages:
+            spc_s2, spt_s2 = self._apply_intermediate_attention(spc_s2, spt_s2, 2)
+        logits_s2 = self.classifier_s2(self._fuse_features_for_classification(spc_s2, spt_s2))
+        halt_prob_s2 = self.halting_unit_s2(spc_s2)
+        stage_logits.append(logits_s2)
+        halting_probs.append(halt_prob_s2)
+
+        # Stage 3
+        spc_s3_in = F.relu(self.spec_bn2(self.spec_conv2(spc_s2)))
+        spt_s3_in = F.relu(self.spatial_bn2(self.spatial_conv2(spt_s2)))
+        spc_s3 = self.spec_stage3(spc_s3_in)
+        spt_s3 = self.spatial_stage3(spt_s3_in)
+        logits_s3 = self.classifier_s3(self._fuse_features_for_classification(spc_s3, spt_s3))
         halt_prob_s3 = torch.ones(B, 1, device=device)
-        
         stage_logits.append(logits_s3)
         halting_probs.append(halt_prob_s3)
-        
+
+        weighted_logits, ponder_cost, halting_step, _ = self.act_controller.compute_act_output(stage_logits, halting_probs)
         if return_ponder_cost:
-            weighted_logits, ponder_cost, halting_step, _ = self.act_controller.compute_act_output(
-                stage_logits, halting_probs
-            )
             return weighted_logits, ponder_cost, halting_step
-        else:
-            weighted_logits, _, halting_step, _ = self.act_controller.compute_act_output(
-                stage_logits, halting_probs
-            )
-            return weighted_logits, None, halting_step
+        return weighted_logits, None, halting_step
+
+    def _forward_act_hard(self, x_spatial: torch.Tensor, return_ponder_cost: bool) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """
+        Hard ACT path (skips deeper stages for halted samples, used for inference efficiency).
+        """
+        B = x_spatial.shape[0]
+        device = x_spatial.device
+        threshold = self.act_controller.threshold
+
+        spt = self.spatial_relu_in(self.spatial_bn_in(self.spatial_conv_in(x_spatial)))
+        center = self.patch_size // 2
+        x_spectral = x_spatial[:, :, center, center].unsqueeze(1)
+        spc = self.spec_relu_in(self.spec_bn_in(self.spec_conv_in(x_spectral)))
+
+        weighted_logits = torch.zeros(B, self.num_classes, device=device)
+        cumulative_prob = torch.zeros(B, 1, device=device)
+        halting_step = torch.zeros(B, dtype=torch.long, device=device)
+        active = torch.ones(B, dtype=torch.bool, device=device)
+
+        # Stage 1 (all samples)
+        spc_s1 = self.spec_stage1(spc)
+        spt_s1 = self.spatial_stage1(spt)
+        if 1 in self.intermediate_stages:
+            spc_s1, spt_s1 = self._apply_intermediate_attention(spc_s1, spt_s1, 1)
+        logits_s1 = self.classifier_s1(self._fuse_features_for_classification(spc_s1, spt_s1))
+        p1 = self.halting_unit_s1(spc_s1)  # (B, 1)
+
+        should_halt_1 = active & (p1.squeeze(-1) >= threshold)
+        continuing_1 = active & ~should_halt_1
+
+        w1 = torch.zeros(B, 1, device=device)
+        w1[should_halt_1] = 1.0
+        w1[continuing_1] = p1[continuing_1]
+        weighted_logits = weighted_logits + logits_s1 * w1
+        halting_step[should_halt_1] = 1
+
+        cumulative_prob[continuing_1] = p1[continuing_1]
+        active = continuing_1
+
+        # Stage 2 (active subset)
+        if active.any():
+            idx2 = active.nonzero(as_tuple=False).squeeze(-1)
+            spc_s1_a = spc_s1[idx2]
+            spt_s1_a = spt_s1[idx2]
+            cum_a = cumulative_prob[idx2]
+
+            spc_s2_in = F.relu(self.spec_bn1(self.spec_conv1(spc_s1_a)))
+            spt_s2_in = F.relu(self.spatial_bn1(self.spatial_conv1(spt_s1_a)))
+            spc_s2 = self.spec_stage2(spc_s2_in)
+            spt_s2 = self.spatial_stage2(spt_s2_in)
+            if 2 in self.intermediate_stages:
+                spc_s2, spt_s2 = self._apply_intermediate_attention(spc_s2, spt_s2, 2)
+
+            logits_s2 = self.classifier_s2(self._fuse_features_for_classification(spc_s2, spt_s2))
+            p2 = self.halting_unit_s2(spc_s2)  # (B_active, 1)
+
+            should_halt_2 = (cum_a.squeeze(-1) + p2.squeeze(-1)) >= threshold
+            continuing_2 = ~should_halt_2
+
+            w2 = torch.zeros(idx2.numel(), 1, device=device)
+            w2[should_halt_2] = (1.0 - cum_a[should_halt_2]).clamp(min=0.0)
+            w2[continuing_2] = p2[continuing_2]
+            weighted_logits[idx2] = weighted_logits[idx2] + logits_s2 * w2
+
+            halting_step[idx2[should_halt_2]] = 2
+            cumulative_prob[idx2[continuing_2]] = cum_a[continuing_2] + p2[continuing_2]
+            active[idx2[should_halt_2]] = False
+
+            # Stage 3 (remaining active subset)
+            if continuing_2.any():
+                idx3 = idx2[continuing_2]
+                spc_s2_a = spc_s2[continuing_2]
+                spt_s2_a = spt_s2[continuing_2]
+                cum3 = cumulative_prob[idx3]
+
+                spc_s3_in = F.relu(self.spec_bn2(self.spec_conv2(spc_s2_a)))
+                spt_s3_in = F.relu(self.spatial_bn2(self.spatial_conv2(spt_s2_a)))
+                spc_s3 = self.spec_stage3(spc_s3_in)
+                spt_s3 = self.spatial_stage3(spt_s3_in)
+                logits_s3 = self.classifier_s3(self._fuse_features_for_classification(spc_s3, spt_s3))
+
+                w3 = (1.0 - cum3).clamp(min=0.0)
+                weighted_logits[idx3] = weighted_logits[idx3] + logits_s3 * w3
+                halting_step[idx3] = 3
+
+        # Any remaining unset samples (numerical edge cases) default to stage 3.
+        halting_step = torch.where(halting_step == 0, torch.full_like(halting_step, 3), halting_step)
+
+        ponder_cost = halting_step.float() if return_ponder_cost else None
+        return weighted_logits, ponder_cost, halting_step
+
+    def forward(self, x_spatial: torch.Tensor, return_ponder_cost: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.training:
+            return self._forward_act_soft(x_spatial, return_ponder_cost=return_ponder_cost)
+        return self._forward_act_hard(x_spatial, return_ponder_cost=return_ponder_cost)
 
     def forward_fixed_depth(self, x_spatial: torch.Tensor) -> torch.Tensor:
         """ Forward pass using fixed full depth (no early exit). """
