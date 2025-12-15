@@ -11,8 +11,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 # Configuration
 # -----------------------------------------------------------------------------
 
-RESULTS_DIR = "/home/denis/projects/DSSFN-BCA/results/configurations"
-OUTPUT_FILE = "/home/denis/projects/DSSFN-BCA/results/COMPREHENSIVE_RESULTS_SUMMARY.md"
+# Resolve paths relative to the repository root (portable across machines).
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
+
+RESULTS_DIR = os.path.join(_PROJECT_ROOT, "results", "configurations")
+OUTPUT_FILE = os.path.join(_PROJECT_ROOT, "results", "COMPREHENSIVE_RESULTS_SUMMARY.md")
 
 # Metrics where "higher is better" (others default to higher unless listed in COST_METRICS)
 BENEFIT_METRICS = {
@@ -88,6 +92,9 @@ def _discover_latest_jsons() -> Dict[ResultKey, str]:
         dataset, tr, vr, ts = parsed
         # config_id = .../results/configurations/{config_id}/evaluation/...
         config_id = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        # Ignore scratch/temporary configs (useful for quick experiments).
+        if config_id.startswith("_") or config_id.lower().startswith("scratch"):
+            continue
         key = ResultKey(config_id=config_id, dataset=dataset, train_ratio=tr, val_ratio=vr)
         prev = latest.get(key)
         if prev is None or ts > prev[0]:
@@ -166,6 +173,18 @@ def _json_compact(value: Any) -> str:
         return str(value)
 
 
+def _is_table_scalar(value: Any) -> bool:
+    """Whether a value is suitable for compact display in markdown tables."""
+    if value is None:
+        return True
+    if isinstance(value, (int, float, str, bool)):
+        return True
+    # Short, simple lists are OK (e.g., intermediate_attention).
+    if isinstance(value, list):
+        return len(value) <= 12 and all(isinstance(v, (int, float, str, bool, type(None))) for v in value)
+    return False
+
+
 def _as_number(x: Any) -> Optional[float]:
     if isinstance(x, (int, float)):
         return float(x)
@@ -232,6 +251,40 @@ def parse_json(filepath: str) -> Dict[str, Any]:
     }
 
 
+def _pretty_json(data: Any) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+    except Exception:
+        return json.dumps({"unserializable": str(data)}, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _try_load_json(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _find_related_optimization_json(config_id: str, dataset: str) -> Optional[str]:
+    """Return absolute path to the optimization JSON that produced this config, if any."""
+    # Convention from optimize_model.py:
+    #   results/configurations/{model_type}/optimization/best_params_{model_type}_{dataset}{_mc}.json
+    if config_id == "bca_sc_optimized":
+        # SC BCA architecture lives under configurations/bca/optimization/
+        return os.path.join(RESULTS_DIR, "bca", "optimization", f"best_params_bca_{dataset}.json")
+    if config_id == "adaptive_mc_optimized":
+        # MC adaptive params live under configurations/adaptive/optimization/
+        return os.path.join(RESULTS_DIR, "adaptive", "optimization", f"best_params_adaptive_{dataset}_mc.json")
+    if config_id == "adaptive_sc_optimized":
+        return os.path.join(RESULTS_DIR, "adaptive", "optimization", f"best_params_adaptive_{dataset}.json")
+    return None
+
+
 def _metric_is_cost(metric_name: str) -> bool:
     return metric_name in COST_METRICS
 
@@ -260,6 +313,11 @@ def generate_markdown():
     for key, path in sorted(latest.items(), key=lambda kv: (kv[0].train_ratio, kv[0].val_ratio, kv[0].dataset, kv[0].config_id)):
         parsed = parse_json(path)
         rel_source = os.path.relpath(path, start=os.path.dirname(OUTPUT_FILE))
+
+        opt_path = _find_related_optimization_json(key.config_id, key.dataset)
+        opt_raw = _try_load_json(opt_path)
+        opt_rel = os.path.relpath(opt_path, start=os.path.dirname(OUTPUT_FILE)) if opt_path else None
+
         records.append(
             {
                 "config_id": key.config_id,
@@ -269,7 +327,10 @@ def generate_markdown():
                 "val_ratio": key.val_ratio,
                 "metrics": parsed["metrics"],
                 "params": parsed["params"],
+                "eval_raw": parsed["raw"],
                 "source": rel_source.replace(os.sep, "/"),
+                "opt_source": opt_rel.replace(os.sep, "/") if opt_rel else None,
+                "opt_raw": opt_raw,
             }
         )
 
@@ -300,8 +361,22 @@ def generate_markdown():
             ds_rows.sort(key=lambda r: r["model"])
 
             # Collect all metric/param keys for this dataset
-            metric_keys = sorted({k for r in ds_rows for k in (r["metrics"] or {}).keys()})
-            param_keys = sorted({k for r in ds_rows for k in (r["params"] or {}).keys()})
+            metric_keys = sorted(
+                {
+                    k
+                    for r in ds_rows
+                    for k, v in (r["metrics"] or {}).items()
+                    if isinstance(v, (int, float))
+                }
+            )
+            param_keys = sorted(
+                {
+                    k
+                    for r in ds_rows
+                    for k, v in (r["params"] or {}).items()
+                    if _is_table_scalar(v)
+                }
+            )
 
             md.append(f"### {dataset}\n")
 
@@ -310,6 +385,10 @@ def generate_markdown():
             header = ["Model"] + metric_keys + ["Source"]
             md.append("| " + " | ".join(header) + " |")
             md.append("|" + "|".join(["---"] * len(header)) + "|")
+
+            # Best model row marker: bold model name for best OA (if available).
+            oa_vals = [_as_number((r["metrics"] or {}).get("OA")) for r in ds_rows]
+            best_oa = _best_value(oa_vals, is_cost=False)
 
             # Pre-compute best per metric column
             best_by_metric: Dict[str, Optional[float]] = {}
@@ -322,7 +401,11 @@ def generate_markdown():
                 best_by_metric[mk] = _best_value(vals, is_cost=is_cost)
 
             for r in ds_rows:
-                row = [r["model"]]
+                model_cell = r["model"]
+                oa_num = _as_number((r["metrics"] or {}).get("OA"))
+                if _is_best(oa_num, best_oa):
+                    model_cell = f"**{model_cell}**"
+                row = [model_cell]
                 for mk in metric_keys:
                     raw_val = (r["metrics"] or {}).get(mk)
                     num_val = _as_number(raw_val)
@@ -339,11 +422,42 @@ def generate_markdown():
             md.append("| " + " | ".join(p_header) + " |")
             md.append("|" + "|".join(["---"] * len(p_header)) + "|")
             for r in ds_rows:
-                prow = [r["model"]]
+                model_cell = r["model"]
+                oa_num = _as_number((r["metrics"] or {}).get("OA"))
+                if _is_best(oa_num, best_oa):
+                    model_cell = f"**{model_cell}**"
+                prow = [model_cell]
                 for pk in param_keys:
                     prow.append(_json_compact((r["params"] or {}).get(pk)))
                 prow.append(f"[{os.path.basename(r['source'])}]({r['source']})")
                 md.append("| " + " | ".join(prow) + " |")
+
+            # ---- Raw JSON dumps (evaluation + optimization) ----
+            md.append("\n#### Raw JSON (Evaluation + Optimization)\n")
+            md.append(
+                "<details><summary>Show/hide raw JSON for this dataset/split</summary>\n"
+            )
+            md.append("")
+            for r in ds_rows:
+                md.append(f"##### {r['model']}\n")
+                md.append(f"- Evaluation: [{os.path.basename(r['source'])}]({r['source']})")
+                if r.get("opt_source"):
+                    md.append(f"- Optimization: [{os.path.basename(r['opt_source'])}]({r['opt_source']})")
+
+                md.append("\n**Evaluation JSON:**\n")
+                md.append("```json")
+                md.append(_pretty_json(r.get("eval_raw")))
+                md.append("```")
+
+                if r.get("opt_raw") is not None:
+                    md.append("\n**Optimization JSON:**\n")
+                    md.append("```json")
+                    md.append(_pretty_json(r.get("opt_raw")))
+                    md.append("```")
+
+                md.append("")
+
+            md.append("</details>\n")
             md.append("")
 
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
