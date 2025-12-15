@@ -330,6 +330,10 @@ class ACTController:
             
             # Check if this is the last stage
             is_last_stage = (stage_idx == self.num_stages)
+
+            # Any active sample has "used" this stage (processed its compute path).
+            # This yields a true stage-count ponder cost: halt at stage 2 -> cost 2, etc.
+            ponder_cost = ponder_cost + active.float()
             
             # For active samples, check if we should halt
             should_halt = active & ((cumulative_prob.squeeze(-1) + p_t.squeeze(-1)) >= self.threshold)
@@ -373,9 +377,6 @@ class ACTController:
                 # Update active mask
                 active = active & ~should_halt
             
-            # Track ponder cost (how many stages each sample uses)
-            ponder_cost = ponder_cost + active.float()
-            
             stage_weights.append(weight_t)
         
         # Ponder cost is the sum of "did we process this stage" for each sample
@@ -395,4 +396,3 @@ class ACTController:
             Scalar tensor - mean ponder cost across batch
         """
         return ponder_cost.mean()
-
