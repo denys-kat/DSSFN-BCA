@@ -20,6 +20,21 @@ import argparse
 import sys
 import os
 
+
+def _csv_list(value: str):
+    return [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
+def _float_list(values):
+    # argparse with nargs='+' already gives a list, but we normalize anyway.
+    out = []
+    for v in (values or []):
+        try:
+            out.append(float(v))
+        except Exception:
+            raise argparse.ArgumentTypeError(f"Invalid float value: {v}")
+    return out
+
 def run_command(cmd, step_name):
     print(f"\n{'='*80}")
     print(f"STEP: {step_name}")
@@ -29,8 +44,9 @@ def run_command(cmd, step_name):
     try:
         # Stream output to console
         process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-        for line in process.stdout:
-            print(line, end='')
+        if process.stdout is not None:
+            for line in process.stdout:
+                print(line, end='')
         process.wait()
         
         if process.returncode != 0:
@@ -45,6 +61,34 @@ def main():
     parser = argparse.ArgumentParser(description="Full Experiment Orchestrator")
     parser.add_argument('--trials', type=int, default=20, help="Number of optimization trials")
     parser.add_argument('--gpu', type=int, default=0, help="GPU ID to use")
+
+    # Reproducibility / split protocol
+    parser.add_argument('--seed', type=int, default=42, help="Random seed forwarded to evaluate_model.py")
+    parser.add_argument('--non_deterministic', action='store_true', help="Allow non-deterministic CUDA kernels in evaluation")
+
+    # Dataset / split control
+    parser.add_argument(
+        '--datasets',
+        type=_csv_list,
+        default=['IndianPines', 'PaviaUniversity', 'Botswana'],
+        help="Comma-separated list of datasets to run (default: IndianPines,PaviaUniversity,Botswana).",
+    )
+    parser.add_argument(
+        '--eval_train_ratios',
+        nargs='+',
+        default=[0.05, 0.10, 0.70],
+        help="Train ratios to evaluate (space-separated), e.g. --eval_train_ratios 0.05 0.10 0.70",
+    )
+    parser.add_argument('--val_ratio', type=float, default=0.15, help="Validation ratio")
+    parser.add_argument('--opt_train_ratio', type=float, default=0.05, help="Train ratio for optimization phases")
+
+    # MC selection reference
+    parser.add_argument(
+        '--sc_reference_config',
+        type=str,
+        default='bca_sc_optimized',
+        help="Config ID used as SC reference when selecting MC adaptive params (forwarded to optimize_model.py).",
+    )
     
     args = parser.parse_args()
     
@@ -52,14 +96,16 @@ def main():
     python_exec = sys.executable
     base_cmd = f"CUDA_VISIBLE_DEVICES={args.gpu} {python_exec}"
     
-    datasets = ['IndianPines', 'PaviaUniversity', 'Botswana']
-    
+    datasets = args.datasets
+
     # Ratios for Evaluation phases
-    eval_ratios = [0.05, 0.10, 0.70]
-    val_ratio = 0.15
-    
+    eval_ratios = _float_list(args.eval_train_ratios)
+    val_ratio = float(args.val_ratio)
+
     # Ratio for Optimization phases
-    opt_train_ratio = 0.05
+    opt_train_ratio = float(args.opt_train_ratio)
+
+    eval_seed_args = f"--seed {args.seed}" + (" --non_deterministic" if args.non_deterministic else "")
     
     # =========================================================================
     # PHASE 1: Base Preset (Eval)
@@ -68,8 +114,8 @@ def main():
     for dataset in datasets:
         for tr in eval_ratios:
             run_command(
-                f"{base_cmd} scripts/main.py --dataset {dataset} --preset base --train_ratio {tr} --val_ratio {val_ratio}",
-                f"1. Train + Eval Base Preset ({dataset}, Train={tr})"
+                f"{base_cmd} scripts/evaluate_model.py --dataset {dataset} --model_type base --config_name base --train_ratio {tr} --val_ratio {val_ratio} {eval_seed_args}",
+                f"1. Train + Eval Base ({dataset}, Train={tr})"
             )
 
     # =========================================================================
@@ -79,8 +125,8 @@ def main():
     for dataset in datasets:
         for tr in eval_ratios:
             run_command(
-                f"{base_cmd} scripts/main.py --dataset {dataset} --preset bca --train_ratio {tr} --val_ratio {val_ratio}",
-                f"2. Train + Eval BCA Preset ({dataset}, Train={tr})"
+                f"{base_cmd} scripts/evaluate_model.py --dataset {dataset} --model_type bca --config_name bca --train_ratio {tr} --val_ratio {val_ratio} {eval_seed_args}",
+                f"2. Train + Eval BCA ({dataset}, Train={tr})"
             )
 
     # =========================================================================
@@ -102,7 +148,7 @@ def main():
         bca_params = f"results/configurations/bca/optimization/best_params_bca_{dataset}.json"
         for tr in eval_ratios:
             run_command(
-                f"{base_cmd} scripts/evaluate_model.py --dataset {dataset} --model_type bca --params_file {bca_params} --config_name bca_sc_optimized --train_ratio {tr} --val_ratio {val_ratio}",
+                f"{base_cmd} scripts/evaluate_model.py --dataset {dataset} --model_type bca --params_file {bca_params} --config_name bca_sc_optimized --train_ratio {tr} --val_ratio {val_ratio} {eval_seed_args}",
                 f"4. Evaluation - Optimized BCA (SC) ({dataset}, Train={tr})"
             )
 
@@ -113,7 +159,7 @@ def main():
     for dataset in datasets:
         # Note: optimize_model.py 'adaptive' mode automatically loads BCA architecture from step 3
         run_command(
-            f"{base_cmd} scripts/optimize_model.py --dataset {dataset} --model_type adaptive --trials {args.trials} --train_ratio {opt_train_ratio} --val_ratio {val_ratio} --no_early_stopping --multicriteria",
+            f"{base_cmd} scripts/optimize_model.py --dataset {dataset} --model_type adaptive --trials {args.trials} --train_ratio {opt_train_ratio} --val_ratio {val_ratio} --no_early_stopping --multicriteria --sc_reference_config {args.sc_reference_config}",
             f"5. Optimization (MC) - Adaptive ({dataset})"
         )
 
@@ -126,7 +172,7 @@ def main():
         adaptive_mc_params = f"results/configurations/adaptive/optimization/best_params_adaptive_{dataset}_mc.json"
         for tr in eval_ratios:
             run_command(
-                f"{base_cmd} scripts/evaluate_model.py --dataset {dataset} --model_type adaptive --params_file {adaptive_mc_params} --config_name adaptive_mc_optimized --train_ratio {tr} --val_ratio {val_ratio}",
+                f"{base_cmd} scripts/evaluate_model.py --dataset {dataset} --model_type adaptive --params_file {adaptive_mc_params} --config_name adaptive_mc_optimized --train_ratio {tr} --val_ratio {val_ratio} {eval_seed_args}",
                 f"6. Evaluation - Optimized Adaptive (MC) ({dataset}, Train={tr})"
             )
     
