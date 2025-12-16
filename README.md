@@ -154,6 +154,14 @@ After evaluations, regenerate `results/COMPREHENSIVE_RESULTS_SUMMARY.md`:
 python scripts/generate_summary.py
 ```
 
+To generate a lightweight version (no embedded raw JSON / long reports):
+
+```bash
+python scripts/generate_summary.py --light
+```
+
+This writes `results/COMPREHENSIVE_RESULTS_SUMMARY_LIGHT.md`.
+
 The generated summary:
 
 - selects the latest evaluation JSON per (config, dataset, split)

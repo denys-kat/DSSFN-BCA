@@ -4,6 +4,7 @@ import glob
 import datetime
 import re
 import math
+import argparse
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -17,6 +18,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
 
 RESULTS_DIR = os.path.join(_PROJECT_ROOT, "results", "configurations")
 OUTPUT_FILE = os.path.join(_PROJECT_ROOT, "results", "COMPREHENSIVE_RESULTS_SUMMARY.md")
+OUTPUT_FILE_LIGHT = os.path.join(_PROJECT_ROOT, "results", "COMPREHENSIVE_RESULTS_SUMMARY_LIGHT.md")
 
 # Metrics where "higher is better" (others default to higher unless listed in COST_METRICS)
 BENEFIT_METRICS = {
@@ -31,6 +33,40 @@ COST_METRICS = {
     "InferenceMs",
     "FLOPs",
 }
+
+
+# Curated keys for lightweight summaries (keeps thesis-relevant knobs without noise).
+LIGHT_METRICS_ORDER = [
+    "OA",
+    "AA",
+    "Kappa",
+    "FLOPs",
+    "InferenceMs",
+    "TrainTime",
+]
+
+LIGHT_PARAM_KEYS_ORDER = [
+    # Data / preprocessing
+    "band_selection",
+    "band_selection_effective",
+    "input_bands",
+    "efdpc_dc_percent",
+    "swgmf_bands",
+    # Architecture
+    "fusion_mechanism",
+    "intermediate_attention",
+    "cross_attention_heads",
+    "s1_channels",
+    "spec_c2",
+    "spat_c2",
+    "s3_channels",
+    # Adaptive / ACT
+    "avg_blocks",
+    "act_epsilon",
+    "halting_bias_init",
+    "ponder_cost_weight",
+    "depth_penalty_scale",
+]
 
 
 @dataclass(frozen=True)
@@ -216,6 +252,27 @@ def _format_metric(metric_name: str, value: Any) -> str:
     return _json_compact(value)
 
 
+def _extract_depth_stat(metrics: Dict[str, Any], key: str) -> Any:
+    ds = (metrics or {}).get("depth_stats")
+    if not isinstance(ds, dict):
+        return None
+    return ds.get(key)
+
+
+def _format_depth_stat(key: str, value: Any) -> str:
+    if value is None:
+        return "N/A"
+    n = _as_number(value)
+    if n is None:
+        return _json_compact(value)
+    if key in {"avg_depth"}:
+        return f"{n:.3f}"
+    if key in {"flops_reduction"}:
+        # Stored as fraction (e.g., 0.12) -> percent.
+        return f"{n * 100:.2f}%"
+    return f"{n:.4f}"
+
+
 def _extract_input_bands(filepath: str, params: Dict[str, Any]) -> Any:
     # Prefer explicit params
     if "input_bands" in params:
@@ -305,18 +362,21 @@ def _is_best(value: Optional[float], best: Optional[float]) -> bool:
         return False
     return math.isclose(value, best, rel_tol=1e-9, abs_tol=1e-12)
 
-def generate_markdown():
+def generate_markdown(output_file: str, *, light: bool = False):
     latest = _discover_latest_jsons()
 
     # Organize selected results
     records: List[Dict[str, Any]] = []
     for key, path in sorted(latest.items(), key=lambda kv: (kv[0].train_ratio, kv[0].val_ratio, kv[0].dataset, kv[0].config_id)):
         parsed = parse_json(path)
-        rel_source = os.path.relpath(path, start=os.path.dirname(OUTPUT_FILE))
+        rel_source = os.path.relpath(path, start=os.path.dirname(output_file))
+
+        log_path = get_log_file(path)
+        rel_log = os.path.relpath(log_path, start=os.path.dirname(output_file)) if log_path else None
 
         opt_path = _find_related_optimization_json(key.config_id, key.dataset)
         opt_raw = _try_load_json(opt_path)
-        opt_rel = os.path.relpath(opt_path, start=os.path.dirname(OUTPUT_FILE)) if opt_path else None
+        opt_rel = os.path.relpath(opt_path, start=os.path.dirname(output_file)) if opt_path else None
 
         records.append(
             {
@@ -329,6 +389,7 @@ def generate_markdown():
                 "params": parsed["params"],
                 "eval_raw": parsed["raw"],
                 "source": rel_source.replace(os.sep, "/"),
+                "log_source": rel_log.replace(os.sep, "/") if rel_log else None,
                 "opt_source": opt_rel.replace(os.sep, "/") if opt_rel else None,
                 "opt_raw": opt_raw,
             }
@@ -341,7 +402,8 @@ def generate_markdown():
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     md: List[str] = []
-    md.append("# Comprehensive DSSFN Model Comparison Results\n")
+    title_suffix = " (Lightweight)" if light else ""
+    md.append(f"# Comprehensive DSSFN Model Comparison Results{title_suffix}\n")
     md.append(f"**Last Updated:** {now}\n")
     md.append("## Experiment Summary\n")
     md.append(
@@ -350,6 +412,31 @@ def generate_markdown():
     md.append(
         "For each dataset and training ratio, the best value per metric column is highlighted in **bold** (maximized for accuracy metrics, minimized for cost metrics like time/FLOPs).\n"
     )
+
+    if light:
+        md.append(
+            "This *light* version intentionally omits embedded raw JSON, long classification reports, and artifact links to keep the file small. "
+            "It is meant for thesis writing and discussion; raw artifacts remain in `results/configurations/` if you need to audit details.\n"
+        )
+
+    # Quick top-level winners summary (thesis-friendly, low weight).
+    md.append("## Best-by-OA Snapshot\n")
+    md.append("Best model per (dataset, train ratio, val ratio) by OA (ties broken by latest timestamp via file selection):\n")
+    md.append("")
+    md.append("| Train | Val | Dataset | Best Model | OA |")
+    md.append("|---:|---:|---|---|---:|")
+    for (train_ratio, val_ratio), group_records in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1])):
+        for dataset in sorted({r["dataset"] for r in group_records}):
+            ds_rows = [r for r in group_records if r["dataset"] == dataset]
+            ds_rows.sort(key=lambda r: (_as_number((r["metrics"] or {}).get("OA")) or float("-inf")), reverse=True)
+            best = ds_rows[0] if ds_rows else None
+            if not best:
+                continue
+            oa = _as_number((best["metrics"] or {}).get("OA"))
+            oa_s = _format_metric("OA", oa) if oa is not None else "N/A"
+            md.append(
+                f"| {train_ratio:.2f} | {val_ratio:.2f} | {dataset} | {best['model']} | {oa_s} |"
+            )
 
     for (train_ratio, val_ratio), group_records in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1])):
         md.append(f"## Results (Train: {train_ratio:.2f}, Val: {val_ratio:.2f})\n")
@@ -361,7 +448,7 @@ def generate_markdown():
             ds_rows.sort(key=lambda r: r["model"])
 
             # Collect all metric/param keys for this dataset
-            metric_keys = sorted(
+            numeric_metric_keys = sorted(
                 {
                     k
                     for r in ds_rows
@@ -369,20 +456,33 @@ def generate_markdown():
                     if isinstance(v, (int, float))
                 }
             )
-            param_keys = sorted(
-                {
-                    k
-                    for r in ds_rows
-                    for k, v in (r["params"] or {}).items()
-                    if _is_table_scalar(v)
-                }
-            )
+            if light:
+                metric_keys = [k for k in LIGHT_METRICS_ORDER if k in numeric_metric_keys]
+            else:
+                metric_keys = numeric_metric_keys
+
+            if light:
+                # Prefer curated order, but only include keys present at least once.
+                present = {k for r in ds_rows for k in (r["params"] or {}).keys()}
+                param_keys = [k for k in LIGHT_PARAM_KEYS_ORDER if k in present]
+            else:
+                param_keys = sorted(
+                    {
+                        k
+                        for r in ds_rows
+                        for k, v in (r["params"] or {}).items()
+                        if _is_table_scalar(v)
+                    }
+                )
 
             md.append(f"### {dataset}\n")
 
             # ---- Metrics table (with bolding) ----
             md.append("#### Metrics\n")
-            header = ["Model"] + metric_keys + ["Source"]
+            extra_depth_cols: List[str] = []
+            if light:
+                extra_depth_cols = ["AvgDepth", "FLOPsReduction"]
+            header = ["Model"] + metric_keys + extra_depth_cols
             md.append("| " + " | ".join(header) + " |")
             md.append("|" + "|".join(["---"] * len(header)) + "|")
 
@@ -413,12 +513,16 @@ def generate_markdown():
                     if _is_best(num_val, best_by_metric.get(mk)):
                         cell = f"**{cell}**"
                     row.append(cell)
-                row.append(f"[{os.path.basename(r['source'])}]({r['source']})")
+                if light:
+                    avg_depth = _extract_depth_stat(r.get("metrics") or {}, "avg_depth")
+                    flops_red = _extract_depth_stat(r.get("metrics") or {}, "flops_reduction")
+                    row.append(_format_depth_stat("avg_depth", avg_depth))
+                    row.append(_format_depth_stat("flops_reduction", flops_red))
                 md.append("| " + " | ".join(row) + " |")
 
             # ---- Hyperparameters table ----
             md.append("\n#### Hyperparameters\n")
-            p_header = ["Model"] + param_keys + ["Source"]
+            p_header = ["Model"] + param_keys
             md.append("| " + " | ".join(p_header) + " |")
             md.append("|" + "|".join(["---"] * len(p_header)) + "|")
             for r in ds_rows:
@@ -429,41 +533,60 @@ def generate_markdown():
                 prow = [model_cell]
                 for pk in param_keys:
                     prow.append(_json_compact((r["params"] or {}).get(pk)))
-                prow.append(f"[{os.path.basename(r['source'])}]({r['source']})")
                 md.append("| " + " | ".join(prow) + " |")
 
             # ---- Raw JSON dumps (evaluation + optimization) ----
-            md.append("\n#### Raw JSON (Evaluation + Optimization)\n")
-            md.append(
-                "<details><summary>Show/hide raw JSON for this dataset/split</summary>\n"
-            )
-            md.append("")
-            for r in ds_rows:
-                md.append(f"##### {r['model']}\n")
-                md.append(f"- Evaluation: [{os.path.basename(r['source'])}]({r['source']})")
-                if r.get("opt_source"):
-                    md.append(f"- Optimization: [{os.path.basename(r['opt_source'])}]({r['opt_source']})")
+            if not light:
+                md.append("\n#### Raw JSON (Evaluation + Optimization)\n")
+                md.append(
+                    "<details><summary>Show/hide raw JSON for this dataset/split</summary>\n"
+                )
+                md.append("")
+                for r in ds_rows:
+                    md.append(f"##### {r['model']}\n")
+                    md.append(f"- Evaluation: [{os.path.basename(r['source'])}]({r['source']})")
+                    if r.get("opt_source"):
+                        md.append(f"- Optimization: [{os.path.basename(r['opt_source'])}]({r['opt_source']})")
 
-                md.append("\n**Evaluation JSON:**\n")
-                md.append("```json")
-                md.append(_pretty_json(r.get("eval_raw")))
-                md.append("```")
-
-                if r.get("opt_raw") is not None:
-                    md.append("\n**Optimization JSON:**\n")
+                    md.append("\n**Evaluation JSON:**\n")
                     md.append("```json")
-                    md.append(_pretty_json(r.get("opt_raw")))
+                    md.append(_pretty_json(r.get("eval_raw")))
                     md.append("```")
 
+                    if r.get("opt_raw") is not None:
+                        md.append("\n**Optimization JSON:**\n")
+                        md.append("```json")
+                        md.append(_pretty_json(r.get("opt_raw")))
+                        md.append("```")
+
+                    md.append("")
+
+                md.append("</details>\n")
                 md.append("")
 
-            md.append("</details>\n")
-            md.append("")
-
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    with open(OUTPUT_FILE, "w") as f:
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w") as f:
         f.write("\n".join(md).rstrip() + "\n")
-    print(f"Summary generated at {OUTPUT_FILE}")
+    print(f"Summary generated at {output_file}")
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Generate a comprehensive results summary markdown.")
+    p.add_argument(
+        "--light",
+        action="store_true",
+        help="Generate a lightweight summary without embedded raw JSON / large reports.",
+    )
+    p.add_argument(
+        "--output",
+        default=None,
+        help="Optional output markdown path. Defaults to the standard summary path (or a LIGHT variant when --light is set).",
+    )
+    return p.parse_args()
+
 
 if __name__ == "__main__":
-    generate_markdown()
+    args = _parse_args()
+    out = args.output
+    if not out:
+        out = OUTPUT_FILE_LIGHT if args.light else OUTPUT_FILE
+    generate_markdown(out, light=args.light)
